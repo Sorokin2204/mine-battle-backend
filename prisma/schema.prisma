@@ -1,0 +1,145 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              Int       @id @default(autoincrement())
+  telegramId      String    @unique @map("telegram_id")
+  username        String?
+  firstName       String?   @map("first_name")
+  lastName        String?   @map("last_name")
+  photoUrl        String?   @map("photo_url")
+  balance         Int       @default(0)
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  defensesCreated Defense[] @relation("DefenseCreator")
+  attacks         Defense[] @relation("DefenseAttacker")
+  transactions    Transaction[]
+
+  @@map("users")
+}
+
+model Defense {
+  id              Int           @id @default(autoincrement())
+  creatorId       Int           @map("creator_id")
+  attackerId      Int?          @map("attacker_id")
+  bet             Int
+  bombPositions   Int[]         @map("bomb_positions")
+  status          DefenseStatus @default(WAITING)
+  expiresAt       DateTime      @map("expires_at")
+  attackStartedAt DateTime?     @map("attack_started_at")
+  moveDeadline    DateTime?     @map("move_deadline")
+
+  attemptsUsed    Int           @default(0) @map("attempts_used")
+  scannersUsed    Int           @default(0) @map("scanners_used")
+  radarsUsed      Int           @default(0) @map("radars_used")
+  bombsFound      Int           @default(0) @map("bombs_found")
+
+  revealedCells   Int[]         @default([]) @map("revealed_cells")
+  scannerResults  Json?         @map("scanner_results")
+  radarResults    Json?         @map("radar_results")
+
+  result          GameResult?
+  winnerId        Int?          @map("winner_id")
+
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+  finishedAt      DateTime?     @map("finished_at")
+
+  creator         User          @relation("DefenseCreator", fields: [creatorId], references: [id])
+  attacker        User?         @relation("DefenseAttacker", fields: [attackerId], references: [id])
+  moves           Move[]
+  transactions    Transaction[]
+
+  @@index([status])
+  @@index([creatorId])
+  @@index([attackerId])
+  @@index([expiresAt])
+  @@map("defenses")
+}
+
+model Move {
+  id          Int       @id @default(autoincrement())
+  defenseId   Int       @map("defense_id")
+  playerId    Int       @map("player_id")
+  moveType    MoveType  @map("move_type")
+  position    Int?
+  positions   Int[]     @default([])
+  result      Json?
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  defense     Defense   @relation(fields: [defenseId], references: [id], onDelete: Cascade)
+
+  @@index([defenseId])
+  @@map("moves")
+}
+
+model Transaction {
+  id          Int             @id @default(autoincrement())
+  userId      Int             @map("user_id")
+  defenseId   Int?            @map("defense_id")
+  type        TransactionType
+  amount      Int
+  balanceBefore Int           @map("balance_before")
+  balanceAfter  Int           @map("balance_after")
+  description String?
+  createdAt   DateTime        @default(now()) @map("created_at")
+
+  user        User            @relation(fields: [userId], references: [id])
+  defense     Defense?        @relation(fields: [defenseId], references: [id])
+
+  @@index([userId])
+  @@index([defenseId])
+  @@map("transactions")
+}
+
+model GameConfig {
+  id                  Int      @id @default(autoincrement())
+  key                 String   @unique
+  value               Json
+  description         String?
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  @@map("game_configs")
+}
+
+enum DefenseStatus {
+  WAITING
+  IN_PROGRESS
+  FINISHED
+  EXPIRED
+  CANCELLED
+}
+
+enum GameResult {
+  ATTACKER_WIN
+  DEFENDER_WIN
+  ATTACKER_TOOK_HALF
+  TIMEOUT
+  EXPIRED
+}
+
+enum MoveType {
+  CLICK
+  SCANNER
+  RADAR
+  TAKE_HALF
+}
+
+enum TransactionType {
+  DEFENSE_CREATE
+  DEFENSE_REFUND
+  ATTACK_BET
+  WIN
+  LOSS
+  TAKE_HALF
+  DEPOSIT
+  WITHDRAWAL
+}
