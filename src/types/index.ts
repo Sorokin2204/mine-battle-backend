@@ -1,5 +1,8 @@
 import { DefenseStatus, GameResult, MoveType } from '@prisma/client';
 
+// DifficultyLevel is also defined in Prisma schema - keep in sync
+export type DifficultyLevel = 'EASY' | 'MEDIUM' | 'HARD';
+
 export interface JwtPayload {
   userId: number;
   telegramId: string;
@@ -37,6 +40,7 @@ export interface DefensePublic {
   creator: UserPublic;
   attacker: UserPublic | null;
   bet: number;
+  difficulty: DifficultyLevel;
   status: DefenseStatus;
   expiresAt: Date;
   attackStartedAt: Date | null;
@@ -46,6 +50,7 @@ export interface DefensePublic {
   radarsUsed: number;
   bombsFound: number;
   revealedCells: number[];
+  foundBombPositions: number[]; // Positions where bombs were found during game
   scannerResults: ScannerResult[] | null;
   radarResults: RadarResult[] | null;
   result: GameResult | null;
@@ -84,6 +89,7 @@ export interface MoveResult {
 
 export interface GetDefensesData {
   includeFinished?: boolean;
+  includeExpired?: boolean;
 }
 
 // Socket Events - Client to Server
@@ -92,14 +98,13 @@ export interface ClientToServerEvents {
   attackDefense: (data: AttackDefenseData, callback: (response: SocketResponse<DefensePublic>) => void) => void;
   makeMove: (data: MakeMoveData, callback: (response: SocketResponse<MoveResult>) => void) => void;
   takeHalf: (data: TakeHalfData, callback: (response: SocketResponse<DefensePublic>) => void) => void;
-  getDefenses: (
-    dataOrCallback: GetDefensesData | ((response: SocketResponse<DefensePublic[]>) => void),
-    callback?: (response: SocketResponse<DefensePublic[]>) => void
-  ) => void;
+  getDefenses: (dataOrCallback: GetDefensesData | ((response: SocketResponse<DefensePublic[]>) => void), callback?: (response: SocketResponse<DefensePublic[]>) => void) => void;
   getDefense: (data: { defenseId: number }, callback: (response: SocketResponse<DefensePublic>) => void) => void;
   joinDefenseRoom: (data: { defenseId: number }) => void;
   leaveDefenseRoom: (data: { defenseId: number }) => void;
   getMe: (callback: (response: SocketResponse<UserWithBalance>) => void) => void;
+  startMatchmaking: (data: StartMatchmakingData, callback: (response: SocketResponse<MatchmakingResponse>) => void) => void;
+  stopMatchmaking: (callback: (response: SocketResponse<null>) => void) => void;
 }
 
 // Socket Events - Server to Client
@@ -113,11 +118,14 @@ export interface ServerToClientEvents {
   timerUpdate: (data: { defenseId: number; timeLeft: number; type: 'move' | 'defense' }) => void;
   balanceUpdated: (data: { balance: number }) => void;
   error: (data: { message: string; code?: string }) => void;
+  matchFound: (data: { defenseId: number; defense: DefensePublic }) => void;
+  matchmakingStarted: (data: { queuePosition: number }) => void;
 }
 
 export interface CreateDefenseData {
   bet: number;
   bombPositions: number[];
+  difficulty: DifficultyLevel;
 }
 
 export interface AttackDefenseData {
@@ -133,6 +141,16 @@ export interface MakeMoveData {
 
 export interface TakeHalfData {
   defenseId: number;
+}
+
+export interface StartMatchmakingData {
+  minBet: number;
+  maxBet: number;
+  difficulty?: DifficultyLevel;
+}
+
+export interface MatchmakingResponse {
+  queuePosition: number;
 }
 
 export interface SocketResponse<T> {

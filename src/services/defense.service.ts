@@ -1,16 +1,12 @@
 import { PrismaClient, Defense, DefenseStatus, GameResult, MoveType } from '@prisma/client';
-import { defaultGameConfig } from '../config/game.config';
+import { getConfigByDifficulty, GameConfig, DifficultyLevel } from '../config/game.config';
 import { DefensePublic, MoveResult, ScannerResult, RadarResult } from '../types';
 import { toUserPublic } from './user.service';
 
 const prisma = new PrismaClient();
 
-export async function createDefense(
-  creatorId: number,
-  bet: number,
-  bombPositions: number[]
-): Promise<Defense> {
-  const config = defaultGameConfig;
+export async function createDefense(creatorId: number, bet: number, bombPositions: number[], difficulty: DifficultyLevel = 'MEDIUM'): Promise<Defense> {
+  const config = getConfigByDifficulty(difficulty);
 
   // Validate bomb positions
   if (bombPositions.length !== config.bombsCount) {
@@ -58,6 +54,7 @@ export async function createDefense(
         creatorId,
         bet,
         bombPositions,
+        difficulty: difficulty as any, // Cast until Prisma client is regenerated
         expiresAt: new Date(Date.now() + config.defenseLifetime),
       },
       include: {
@@ -103,15 +100,25 @@ export async function getActiveDefenses(): Promise<Defense[]> {
   });
 }
 
-export async function getAllDefenses(includeFinished: boolean = false): Promise<Defense[]> {
-  if (!includeFinished) {
+export async function getAllDefenses(includeFinished: boolean = false, includeExpired: boolean = false): Promise<Defense[]> {
+  if (!includeFinished && !includeExpired) {
     return getActiveDefenses();
+  }
+
+  const statuses: DefenseStatus[] = [DefenseStatus.WAITING, DefenseStatus.IN_PROGRESS];
+
+  if (includeFinished) {
+    statuses.push(DefenseStatus.FINISHED);
+  }
+
+  if (includeExpired) {
+    statuses.push(DefenseStatus.EXPIRED);
   }
 
   return prisma.defense.findMany({
     where: {
       status: {
-        in: [DefenseStatus.WAITING, DefenseStatus.IN_PROGRESS, DefenseStatus.FINISHED],
+        in: statuses,
       },
     },
     include: {
@@ -136,13 +143,14 @@ export async function getDefenseById(defenseId: number): Promise<Defense | null>
 }
 
 export async function startAttack(defenseId: number, attackerId: number): Promise<Defense> {
-  const config = defaultGameConfig;
-
   return prisma.$transaction(async (tx) => {
     const defense = await tx.defense.findUnique({
       where: { id: defenseId },
       include: { creator: true },
     });
+
+    const difficulty = ((defense as any)?.difficulty as DifficultyLevel) || 'MEDIUM';
+    const config = getConfigByDifficulty(difficulty);
 
     if (!defense) {
       throw new Error('Defense not found');
@@ -211,19 +219,14 @@ export async function startAttack(defenseId: number, attackerId: number): Promis
   });
 }
 
-export async function makeMove(
-  defenseId: number,
-  attackerId: number,
-  moveType: MoveType,
-  position?: number,
-  positions?: number[]
-): Promise<MoveResult> {
-  const config = defaultGameConfig;
-
+export async function makeMove(defenseId: number, attackerId: number, moveType: MoveType, position?: number, positions?: number[]): Promise<MoveResult> {
   return prisma.$transaction(async (tx) => {
     const defense = await tx.defense.findUnique({
       where: { id: defenseId },
     });
+
+    const difficulty = ((defense as any)?.difficulty as DifficultyLevel) || 'MEDIUM';
+    const config = getConfigByDifficulty(difficulty);
 
     if (!defense) {
       throw new Error('Defense not found');
@@ -264,7 +267,7 @@ export async function makeMove(
         result = await processScannerMove(tx, defense, positions!, config);
         break;
       case MoveType.RADAR:
-        result = await processRadarMove(tx, defense, position!, config);
+        result = await processRadarMove(tx, defense, position!, positions, config);
         break;
       default:
         throw new Error('Invalid move type');
@@ -286,12 +289,7 @@ export async function makeMove(
   });
 }
 
-async function processClickMove(
-  tx: any,
-  defense: Defense,
-  position: number,
-  config: typeof defaultGameConfig
-): Promise<MoveResult> {
+async function processClickMove(tx: any, defense: Defense, position: number, config: GameConfig): Promise<MoveResult> {
   if (defense.attemptsUsed >= config.attempts) {
     throw new Error('No attempts left');
   }
@@ -352,12 +350,7 @@ async function processClickMove(
   };
 }
 
-async function processScannerMove(
-  tx: any,
-  defense: Defense,
-  positions: number[],
-  config: typeof defaultGameConfig
-): Promise<MoveResult> {
+async function processScannerMove(tx: any, defense: Defense, positions: number[], config: GameConfig): Promise<MoveResult> {
   if (defense.scannersUsed >= config.scanners) {
     throw new Error('No scanners left');
   }
@@ -397,19 +390,24 @@ async function processScannerMove(
   };
 }
 
-async function processRadarMove(
-  tx: any,
-  defense: Defense,
-  position: number,
-  config: typeof defaultGameConfig
-): Promise<MoveResult> {
+async function processRadarMove(tx: any, defense: Defense, position: number, positions: number[] | undefined, config: GameConfig): Promise<MoveResult> {
   if (defense.radarsUsed >= config.radars) {
     throw new Error('No radars left');
   }
 
-  // Position encodes row/column: 0-3 for rows, 4-7 for columns
-  const isRow = position < config.fieldSize;
-  const index = isRow ? position : position - config.fieldSize;
+  // If positions array provided: [type (0=row, 1=column), index]
+  // Otherwise fallback to old logic: position < fieldSize = row
+  let isRow: boolean;
+  let index: number;
+
+  if (positions && positions.length >= 2) {
+    isRow = positions[0] === 0;
+    index = positions[1];
+  } else {
+    // Fallback to old logic
+    isRow = position < config.fieldSize;
+    index = isRow ? position : position - config.fieldSize;
+  }
 
   // Count bombs in row/column
   let bombCount = 0;
@@ -538,12 +536,7 @@ export async function takeHalf(defenseId: number, attackerId: number): Promise<D
   });
 }
 
-async function finishGame(
-  tx: any,
-  defenseId: number,
-  result: GameResult,
-  winnerId: number
-): Promise<Defense> {
+async function finishGame(tx: any, defenseId: number, result: GameResult, winnerId: number): Promise<Defense> {
   const defense = await tx.defense.findUnique({
     where: { id: defenseId },
   });
@@ -658,11 +651,15 @@ export async function expireDefense(defenseId: number): Promise<Defense> {
 }
 
 export function toDefensePublic(defense: Defense & { creator: any; attacker: any | null }, isParticipant: boolean = false): DefensePublic {
+  // Calculate found bombs - positions that are in revealedCells AND in bombPositions
+  const foundBombPositions = defense.revealedCells.filter(pos => defense.bombPositions.includes(pos));
+
   return {
     id: defense.id,
     creator: toUserPublic(defense.creator),
     attacker: defense.attacker ? toUserPublic(defense.attacker) : null,
     bet: defense.bet,
+    difficulty: ((defense as any).difficulty as DifficultyLevel) || 'MEDIUM',
     status: defense.status,
     expiresAt: defense.expiresAt,
     attackStartedAt: defense.attackStartedAt,
@@ -672,13 +669,14 @@ export function toDefensePublic(defense: Defense & { creator: any; attacker: any
     radarsUsed: defense.radarsUsed,
     bombsFound: defense.bombsFound,
     revealedCells: defense.revealedCells,
+    foundBombPositions, // Positions where bombs were found during game
     scannerResults: defense.scannerResults as ScannerResult[] | null,
     radarResults: defense.radarResults as RadarResult[] | null,
     result: defense.result,
     winnerId: defense.winnerId,
     createdAt: defense.createdAt,
     finishedAt: defense.finishedAt,
-    // Only reveal bomb positions if game is finished or user is the creator
+    // Only reveal all bomb positions if game is finished
     bombPositions: defense.status === DefenseStatus.FINISHED ? defense.bombPositions : undefined,
   };
 }

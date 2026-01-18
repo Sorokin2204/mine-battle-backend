@@ -9,6 +9,7 @@ import {
   toDefensePublic,
 } from '../../services/defense.service';
 import { getUserById, toUserWithBalance } from '../../services/user.service';
+import { matchmakingService } from '../../services/matchmaking.service';
 import { timerService } from '../../services/timer.service';
 import { checkRateLimit } from '../../middleware/auth.middleware';
 import {
@@ -32,19 +33,20 @@ type GameServer = Server<ClientToServerEvents, ServerToClientEvents, InterServer
 export function registerDefenseHandlers(io: GameServer, socket: GameSocket) {
   const userId = socket.data.userId;
 
-  // Get all defenses (optionally including finished)
+  // Get all defenses (optionally including finished and expired)
   socket.on('getDefenses', async (dataOrCallback, maybeCallback?) => {
     // Support both old signature (callback only) and new signature (data, callback)
     const callback = typeof dataOrCallback === 'function' ? dataOrCallback : maybeCallback!;
-    const data = typeof dataOrCallback === 'function' ? { includeFinished: false } : dataOrCallback;
+    const data = typeof dataOrCallback === 'function' ? { includeFinished: false, includeExpired: false } : dataOrCallback;
     const includeFinished = data.includeFinished ?? false;
+    const includeExpired = data.includeExpired ?? false;
 
     try {
       if (!checkRateLimit(userId, 'getDefenses', 30)) {
         return callback({ success: false, error: 'Rate limit exceeded', code: 'RATE_LIMIT' });
       }
 
-      const defenses = await getAllDefenses(includeFinished);
+      const defenses = await getAllDefenses(includeFinished, includeExpired);
       const defensesPublic = defenses.map((d) => toDefensePublic(d as any));
 
       callback({ success: true, data: defensesPublic });
@@ -82,15 +84,28 @@ export function registerDefenseHandlers(io: GameServer, socket: GameSocket) {
         return callback({ success: false, error: 'Rate limit exceeded', code: 'RATE_LIMIT' });
       }
 
-      const defense = await createDefense(userId, data.bet, data.bombPositions);
+      const defense = await createDefense(userId, data.bet, data.bombPositions, data.difficulty);
 
       // Start defense expiration timer
       timerService.startDefenseTimer(defense.id, defense.expiresAt);
 
       const defensePublic = toDefensePublic(defense as any);
 
-      // Notify all clients about new defense
-      io.emit('defenseCreated', defensePublic);
+      // Check if there's a matching user in the matchmaking queue
+      const matchedUser = matchmakingService.findMatch(defense);
+
+      if (matchedUser) {
+        // Remove matched user from queue
+        matchmakingService.removeFromQueue(matchedUser.userId);
+
+        // Notify matched user about the match
+        io.to(matchedUser.socketId).emit('matchFound', { defenseId: defense.id, defense: defensePublic });
+
+        console.log(`Match found! Defense ${defense.id} matched with user ${matchedUser.userId}`);
+      } else {
+        // No match found - notify all clients about new defense (normal flow)
+        io.emit('defenseCreated', defensePublic);
+      }
 
       // Update creator's balance
       const user = await getUserById(userId);

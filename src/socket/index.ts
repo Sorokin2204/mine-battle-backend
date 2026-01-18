@@ -2,6 +2,7 @@ import { Server as HttpServer } from 'http';
 import { Server } from 'socket.io';
 import { socketAuthMiddleware } from '../middleware/auth.middleware';
 import { registerDefenseHandlers } from './handlers/defense.handler';
+import { registerMatchmakingHandlers } from './handlers/matchmaking.handler';
 import { timerService } from '../services/timer.service';
 import { serverConfig } from '../config/game.config';
 import {
@@ -36,6 +37,7 @@ export function initializeSocket(httpServer: HttpServer) {
 
     // Register event handlers
     registerDefenseHandlers(io, socket);
+    registerMatchmakingHandlers(io, socket);
 
     socket.on('disconnect', (reason) => {
       console.log(`User disconnected: ${socket.data.userId}, reason: ${reason}`);

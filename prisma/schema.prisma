@@ -26,13 +26,14 @@ model User {
 }
 
 model Defense {
-  id              Int           @id @default(autoincrement())
-  creatorId       Int           @map("creator_id")
-  attackerId      Int?          @map("attacker_id")
+  id              Int             @id @default(autoincrement())
+  creatorId       Int             @map("creator_id")
+  attackerId      Int?            @map("attacker_id")
   bet             Int
-  bombPositions   Int[]         @map("bomb_positions")
-  status          DefenseStatus @default(WAITING)
-  expiresAt       DateTime      @map("expires_at")
+  bombPositions   Int[]           @map("bomb_positions")
+  difficulty      DifficultyLevel @default(MEDIUM)
+  status          DefenseStatus   @default(WAITING)
+  expiresAt       DateTime        @map("expires_at")
   attackStartedAt DateTime?     @map("attack_started_at")
   moveDeadline    DateTime?     @map("move_deadline")
 
@@ -116,6 +117,12 @@ enum DefenseStatus {
   FINISHED
   EXPIRED
   CANCELLED
+}
+
+enum DifficultyLevel {
+  EASY
+  MEDIUM
+  HARD
 }
 
 enum GameResult {
