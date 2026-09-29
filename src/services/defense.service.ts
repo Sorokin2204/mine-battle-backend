@@ -83,12 +83,15 @@ export async function createDefense(creatorId: number, bet: number, bombPosition
 export async function getActiveDefenses(): Promise<Defense[]> {
   return prisma.defense.findMany({
     where: {
-      status: {
-        in: [DefenseStatus.WAITING, DefenseStatus.IN_PROGRESS],
-      },
-      expiresAt: {
-        gt: new Date(),
-      },
+      OR: [
+        {
+          status: DefenseStatus.WAITING,
+          expiresAt: { gt: new Date() },
+        },
+        // Once an attack starts, expiresAt no longer applies. The match is
+        // governed exclusively by moveDeadline.
+        { status: DefenseStatus.IN_PROGRESS },
+      ],
     },
     include: {
       creator: true,
@@ -178,29 +181,45 @@ export async function startAttack(defenseId: number, attackerId: number): Promis
       throw new Error('Insufficient balance');
     }
 
-    // Deduct attacker balance
-    await tx.user.update({
-      where: { id: attackerId },
-      data: { balance: { decrement: defense.bet } },
-    });
-
     const now = new Date();
     const moveDeadline = new Date(now.getTime() + config.moveTime);
 
-    // Update defense
-    const updatedDefense = await tx.defense.update({
-      where: { id: defenseId },
+    // Atomically claim the waiting defense so two attackers cannot both pay.
+    const claimed = await tx.defense.updateMany({
+      where: {
+        id: defenseId,
+        status: DefenseStatus.WAITING,
+        expiresAt: { gt: now },
+      },
       data: {
         attackerId,
         status: DefenseStatus.IN_PROGRESS,
         attackStartedAt: now,
         moveDeadline,
       },
+    });
+
+    if (claimed.count !== 1) {
+      throw new Error('Defense is not available for attack');
+    }
+
+    // Deduct attacker balance only after this transaction owns the match.
+    await tx.user.update({
+      where: { id: attackerId },
+      data: { balance: { decrement: defense.bet } },
+    });
+
+    const updatedDefense = await tx.defense.findUnique({
+      where: { id: defenseId },
       include: {
         creator: true,
         attacker: true,
       },
     });
+
+    if (!updatedDefense) {
+      throw new Error('Defense not found after attack started');
+    }
 
     // Create transaction record
     await tx.transaction.create({
@@ -321,11 +340,30 @@ async function processClickMove(tx: any, defense: Defense, position: number, con
   }
 
   if (gameFinished) {
+    // Persist the decisive click before finishing the game. Without this update
+    // the final cell disappeared after the public defense was reloaded.
+    const updated = await tx.defense.updateMany({
+      where: {
+        id: defense.id,
+        status: DefenseStatus.IN_PROGRESS,
+        moveDeadline: { gte: new Date() },
+      },
+      data: {
+        revealedCells: newRevealedCells,
+        bombsFound: newBombsFound,
+        attemptsUsed: newAttemptsUsed,
+      },
+    });
+    if (updated.count !== 1) throw new Error('Move deadline has expired');
     await finishGame(tx, defense.id, gameResult!, winnerId!);
   } else {
     // Reset move timer
-    await tx.defense.update({
-      where: { id: defense.id },
+    const updated = await tx.defense.updateMany({
+      where: {
+        id: defense.id,
+        status: DefenseStatus.IN_PROGRESS,
+        moveDeadline: { gte: new Date() },
+      },
       data: {
         revealedCells: newRevealedCells,
         bombsFound: newBombsFound,
@@ -333,6 +371,7 @@ async function processClickMove(tx: any, defense: Defense, position: number, con
         moveDeadline: new Date(Date.now() + config.moveTime),
       },
     });
+    if (updated.count !== 1) throw new Error('Move deadline has expired');
   }
 
   return {
@@ -364,17 +403,22 @@ async function processScannerMove(tx: any, defense: Defense, positions: number[]
   const bombCount = positions.filter((pos) => defense.bombPositions.includes(pos)).length;
 
   const scannerResult: ScannerResult = { positions, bombCount };
-  const existingResults = (defense.scannerResults as ScannerResult[]) || [];
+  const existingResults = (defense.scannerResults as unknown as ScannerResult[]) || [];
   const newScannerResults = [...existingResults, scannerResult];
 
-  await tx.defense.update({
-    where: { id: defense.id },
+  const updated = await tx.defense.updateMany({
+    where: {
+      id: defense.id,
+      status: DefenseStatus.IN_PROGRESS,
+      moveDeadline: { gte: new Date() },
+    },
     data: {
       scannersUsed: defense.scannersUsed + 1,
       scannerResults: newScannerResults,
       moveDeadline: new Date(Date.now() + config.moveTime),
     },
   });
+  if (updated.count !== 1) throw new Error('Move deadline has expired');
 
   return {
     success: true,
@@ -427,17 +471,22 @@ async function processRadarMove(tx: any, defense: Defense, position: number, pos
     index,
     bombCount,
   };
-  const existingResults = (defense.radarResults as RadarResult[]) || [];
+  const existingResults = (defense.radarResults as unknown as RadarResult[]) || [];
   const newRadarResults = [...existingResults, radarResult];
 
-  await tx.defense.update({
-    where: { id: defense.id },
+  const updated = await tx.defense.updateMany({
+    where: {
+      id: defense.id,
+      status: DefenseStatus.IN_PROGRESS,
+      moveDeadline: { gte: new Date() },
+    },
     data: {
       radarsUsed: defense.radarsUsed + 1,
       radarResults: newRadarResults,
       moveDeadline: new Date(Date.now() + config.moveTime),
     },
   });
+  if (updated.count !== 1) throw new Error('Move deadline has expired');
 
   return {
     success: true,
@@ -481,6 +530,24 @@ export async function takeHalf(defenseId: number, attackerId: number): Promise<D
     const attackerWinnings = halfBet;
     const defenderReturn = totalPot - halfBet;
 
+    const finishedAt = new Date();
+    const claimed = await tx.defense.updateMany({
+      where: {
+        id: defenseId,
+        status: DefenseStatus.IN_PROGRESS,
+        moveDeadline: { gte: finishedAt },
+      },
+      data: {
+        status: DefenseStatus.FINISHED,
+        result: GameResult.ATTACKER_TOOK_HALF,
+        finishedAt,
+      },
+    });
+
+    if (claimed.count !== 1) {
+      throw new Error('Game is already finished');
+    }
+
     // Pay attacker
     const attacker = await tx.user.update({
       where: { id: attackerId },
@@ -493,19 +560,17 @@ export async function takeHalf(defenseId: number, attackerId: number): Promise<D
       data: { balance: { increment: defenderReturn } },
     });
 
-    // Update defense
-    const updatedDefense = await tx.defense.update({
+    const updatedDefense = await tx.defense.findUnique({
       where: { id: defenseId },
-      data: {
-        status: DefenseStatus.FINISHED,
-        result: GameResult.ATTACKER_TOOK_HALF,
-        finishedAt: new Date(),
-      },
       include: {
         creator: true,
         attacker: true,
       },
     });
+
+    if (!updatedDefense) {
+      throw new Error('Defense not found after finishing');
+    }
 
     // Create transaction records
     await tx.transaction.create({
@@ -547,26 +612,42 @@ async function finishGame(tx: any, defenseId: number, result: GameResult, winner
 
   const totalPot = defense.bet * 2;
 
-  // Pay winner
-  const winner = await tx.user.update({
-    where: { id: winnerId },
-    data: { balance: { increment: totalPot } },
-  });
-
-  // Update defense
-  const updatedDefense = await tx.defense.update({
-    where: { id: defenseId },
+  // Claim the finish before paying anybody. Timer callbacks and player moves
+  // may arrive at the same time, so a plain update could pay the pot twice.
+  const claimed = await tx.defense.updateMany({
+    where: {
+      id: defenseId,
+      status: DefenseStatus.IN_PROGRESS,
+    },
     data: {
       status: DefenseStatus.FINISHED,
       result,
       winnerId,
       finishedAt: new Date(),
     },
+  });
+
+  if (claimed.count !== 1) {
+    throw new Error('Game is already finished');
+  }
+
+  // Pay winner
+  const winner = await tx.user.update({
+    where: { id: winnerId },
+    data: { balance: { increment: totalPot } },
+  });
+
+  const updatedDefense = await tx.defense.findUnique({
+    where: { id: defenseId },
     include: {
       creator: true,
       attacker: true,
     },
   });
+
+  if (!updatedDefense) {
+    throw new Error('Defense not found after finishing');
+  }
 
   // Create transaction record
   await tx.transaction.create({
@@ -599,6 +680,23 @@ async function finishGame(tx: any, defenseId: number, result: GameResult, winner
   return updatedDefense;
 }
 
+export async function finishTimedOutDefense(defenseId: number): Promise<Defense | null> {
+  return prisma.$transaction(async (tx) => {
+    const defense = await tx.defense.findUnique({ where: { id: defenseId } });
+
+    if (
+      !defense ||
+      defense.status !== DefenseStatus.IN_PROGRESS ||
+      !defense.moveDeadline ||
+      defense.moveDeadline.getTime() > Date.now()
+    ) {
+      return null;
+    }
+
+    return finishGame(tx, defenseId, GameResult.TIMEOUT, defense.creatorId);
+  });
+}
+
 export async function expireDefense(defenseId: number): Promise<Defense> {
   return prisma.$transaction(async (tx) => {
     const defense = await tx.defense.findUnique({
@@ -609,8 +707,27 @@ export async function expireDefense(defenseId: number): Promise<Defense> {
       throw new Error('Defense not found');
     }
 
-    if (defense.status !== DefenseStatus.WAITING) {
+    if (defense.status !== DefenseStatus.WAITING || defense.expiresAt.getTime() > Date.now()) {
       throw new Error('Defense cannot be expired');
+    }
+
+    // Claim expiration atomically. The maintenance sweep and the exact
+    // timeout can overlap, but only one of them may refund the bet.
+    const claimed = await tx.defense.updateMany({
+      where: {
+        id: defenseId,
+        status: DefenseStatus.WAITING,
+        expiresAt: { lte: new Date() },
+      },
+      data: {
+        status: DefenseStatus.EXPIRED,
+        result: GameResult.EXPIRED,
+        finishedAt: new Date(),
+      },
+    });
+
+    if (claimed.count !== 1) {
+      throw new Error('Defense is already expired');
     }
 
     // Refund creator
@@ -619,19 +736,17 @@ export async function expireDefense(defenseId: number): Promise<Defense> {
       data: { balance: { increment: defense.bet } },
     });
 
-    // Update defense
-    const updatedDefense = await tx.defense.update({
+    const updatedDefense = await tx.defense.findUnique({
       where: { id: defenseId },
-      data: {
-        status: DefenseStatus.EXPIRED,
-        result: GameResult.EXPIRED,
-        finishedAt: new Date(),
-      },
       include: {
         creator: true,
         attacker: true,
       },
     });
+
+    if (!updatedDefense) {
+      throw new Error('Defense not found after expiration');
+    }
 
     // Create refund transaction
     await tx.transaction.create({

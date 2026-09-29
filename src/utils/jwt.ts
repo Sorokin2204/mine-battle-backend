@@ -1,10 +1,10 @@
-import jwt from 'jsonwebtoken';
+import jwt, { SignOptions } from 'jsonwebtoken';
 import { JwtPayload } from '../types';
 import { serverConfig } from '../config/game.config';
 
 export function generateToken(payload: JwtPayload): string {
   return jwt.sign(payload, serverConfig.jwtSecret, {
-    expiresIn: serverConfig.jwtExpiresIn,
+    expiresIn: serverConfig.jwtExpiresIn as SignOptions['expiresIn'],
   });
 }
 

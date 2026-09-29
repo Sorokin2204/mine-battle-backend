@@ -113,6 +113,7 @@ async function main() {
 
   // Initialize Socket.io with the underlying Node.js server
   const io = initializeSocket(fastify.server);
+  await timerService.initialize();
 
   console.log(`Server running on http://${host}:${port}`);
   console.log(`Dev mode: ${serverConfig.devMode}`);

@@ -3,6 +3,13 @@ import { TelegramInitData, UserPublic, UserWithBalance } from '../types';
 
 const prisma = new PrismaClient();
 
+const getDevAvatarUrl = (telegramId: string): string => {
+  const devUserNumber = Number(telegramId.split('_').pop());
+  const avatarId = Number.isInteger(devUserNumber) ? devUserNumber : 1;
+
+  return `https://i.pravatar.cc/150?img=${avatarId}`;
+};
+
 export async function findOrCreateUser(telegramData: TelegramInitData): Promise<User> {
   const telegramId = telegramData.user!.id.toString();
 
@@ -42,14 +49,22 @@ export async function findOrCreateDevUser(telegramId: string): Promise<User> {
     where: { telegramId },
   });
 
+  const photoUrl = getDevAvatarUrl(telegramId);
+
   if (!user) {
     user = await prisma.user.create({
       data: {
         telegramId,
         username: `dev_${telegramId}`,
         firstName: `Dev User ${telegramId.split('_').pop()}`,
+        photoUrl,
         balance: 10000, // More balance for dev users
       },
+    });
+  } else if (user.photoUrl !== photoUrl) {
+    user = await prisma.user.update({
+      where: { id: user.id },
+      data: { photoUrl },
     });
   }
 

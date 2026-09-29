@@ -6,48 +6,30 @@ async function main() {
   console.log('Seeding database...');
 
   // Create test users
-  const users = await Promise.all([
-    prisma.user.upsert({
-      where: { telegramId: 'dev_user_1' },
-      update: {},
-      create: {
-        telegramId: 'dev_user_1',
-        username: 'dev_user_1',
-        firstName: 'Алексей',
-        balance: 10000,
-      },
-    }),
-    prisma.user.upsert({
-      where: { telegramId: 'dev_user_2' },
-      update: {},
-      create: {
-        telegramId: 'dev_user_2',
-        username: 'dev_user_2',
-        firstName: 'Мария',
-        balance: 10000,
-      },
-    }),
-    prisma.user.upsert({
-      where: { telegramId: 'dev_user_3' },
-      update: {},
-      create: {
-        telegramId: 'dev_user_3',
-        username: 'dev_user_3',
-        firstName: 'Дмитрий',
-        balance: 10000,
-      },
-    }),
-    prisma.user.upsert({
-      where: { telegramId: 'dev_user_4' },
-      update: {},
-      create: {
-        telegramId: 'dev_user_4',
-        username: 'dev_user_4',
-        firstName: 'Анна',
-        balance: 10000,
-      },
-    }),
-  ]);
+  const testUsers = [
+    { telegramId: 'dev_user_1', username: 'dev_user_1', firstName: 'Алексей', avatarId: 1 },
+    { telegramId: 'dev_user_2', username: 'dev_user_2', firstName: 'Мария', avatarId: 2 },
+    { telegramId: 'dev_user_3', username: 'dev_user_3', firstName: 'Дмитрий', avatarId: 3 },
+    { telegramId: 'dev_user_4', username: 'dev_user_4', firstName: 'Анна', avatarId: 4 },
+  ];
+
+  const users = await Promise.all(
+    testUsers.map(({ telegramId, username, firstName, avatarId }) => {
+      const photoUrl = `https://i.pravatar.cc/150?img=${avatarId}`;
+
+      return prisma.user.upsert({
+        where: { telegramId },
+        update: { photoUrl },
+        create: {
+          telegramId,
+          username,
+          firstName,
+          photoUrl,
+          balance: 10000,
+        },
+      });
+    })
+  );
 
   console.log(`Created ${users.length} test users`);
 
@@ -63,7 +45,7 @@ async function main() {
         attempts: 4,
         scanners: 1,
         radars: 1,
-        moveTime: 120000,
+        moveTime: 1200000,
         defenseLifetime: 3600000,
         resultsDisplayTime: 10000,
         minBet: 20,

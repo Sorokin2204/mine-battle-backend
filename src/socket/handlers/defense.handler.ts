@@ -102,10 +102,10 @@ export function registerDefenseHandlers(io: GameServer, socket: GameSocket) {
         io.to(matchedUser.socketId).emit('matchFound', { defenseId: defense.id, defense: defensePublic });
 
         console.log(`Match found! Defense ${defense.id} matched with user ${matchedUser.userId}`);
-      } else {
-        // No match found - notify all clients about new defense (normal flow)
-        io.emit('defenseCreated', defensePublic);
       }
+
+      // Keep every connected list in sync, including the creator's badges.
+      io.emit('defenseCreated', defensePublic);
 
       // Update creator's balance
       const user = await getUserById(userId);
@@ -169,10 +169,13 @@ export function registerDefenseHandlers(io: GameServer, socket: GameSocket) {
         data.positions
       );
 
-      // Reset move timer if game continues
-      if (!result.gameFinished) {
-        timerService.resetMoveTimer(data.defenseId);
-      } else {
+      const defense = await getDefenseById(data.defenseId);
+
+      // Schedule exactly the deadline persisted by the move transaction. This
+      // keeps UI, database and server timer on the same timestamp.
+      if (!result.gameFinished && defense?.moveDeadline) {
+        timerService.startMoveTimer(data.defenseId, defense.moveDeadline);
+      } else if (result.gameFinished) {
         timerService.stopAllTimers(data.defenseId);
       }
 
@@ -182,13 +185,13 @@ export function registerDefenseHandlers(io: GameServer, socket: GameSocket) {
         move: result,
       });
 
-      // If game finished, notify everyone
-      if (result.gameFinished) {
-        const defense = await getDefenseById(data.defenseId);
-        if (defense) {
-          const defensePublic = toDefensePublic(defense as any);
+      // Publish every persisted move so badges receive the new moveDeadline.
+      if (defense) {
+        const defensePublic = toDefensePublic(defense as any);
+        io.emit('defenseUpdated', defensePublic);
+
+        if (result.gameFinished) {
           io.to(`defense:${data.defenseId}`).emit('gameFinished', defensePublic);
-          io.emit('defenseUpdated', defensePublic);
 
           // Update both players' balances
           const creator = await getUserById(defense.creatorId);

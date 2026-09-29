@@ -1,7 +1,6 @@
 import { Server } from 'socket.io';
-import { PrismaClient, DefenseStatus, GameResult } from '@prisma/client';
-import { defaultGameConfig } from '../config/game.config';
-import { expireDefense, toDefensePublic, getDefenseById } from './defense.service';
+import { PrismaClient, DefenseStatus } from '@prisma/client';
+import { expireDefense, finishTimedOutDefense, toDefensePublic } from './defense.service';
 import { ServerToClientEvents, ClientToServerEvents, InterServerEvents, SocketData } from '../types';
 
 const prisma = new PrismaClient();
@@ -13,14 +12,28 @@ interface ActiveTimer {
   type: 'defense' | 'move';
   endTime: number;
   intervalId: NodeJS.Timeout;
+  timeoutId: NodeJS.Timeout;
 }
 
 class TimerService {
   private timers: Map<string, ActiveTimer> = new Map();
   private io: GameServer | null = null;
+  private maintenanceInterval: NodeJS.Timeout | null = null;
 
   setServer(io: GameServer) {
     this.io = io;
+  }
+
+  async initialize() {
+    await this.synchronizeTimers();
+
+    if (!this.maintenanceInterval) {
+      // A periodic reconciliation makes the database the source of truth and
+      // recovers from delayed callbacks, process sleeps and transient errors.
+      this.maintenanceInterval = setInterval(() => {
+        void this.synchronizeTimers();
+      }, 15000);
+    }
   }
 
   private getTimerKey(defenseId: number, type: 'defense' | 'move'): string {
@@ -62,11 +75,10 @@ class TimerService {
       }
     }, 10000);
 
-    // Set up timeout for expiration
     const timeoutMs = endTime - now;
-    setTimeout(() => {
-      this.handleDefenseExpire(defenseId);
+    const timeoutId = setTimeout(() => {
       this.clearTimer(key);
+      void this.handleDefenseExpire(defenseId);
     }, timeoutMs);
 
     this.timers.set(key, {
@@ -74,6 +86,7 @@ class TimerService {
       type: 'defense',
       endTime,
       intervalId,
+      timeoutId,
     });
   }
 
@@ -112,11 +125,10 @@ class TimerService {
       }
     }, 1000);
 
-    // Set up timeout for expiration
     const timeoutMs = endTime - now;
-    setTimeout(() => {
-      this.handleMoveTimeout(defenseId);
+    const timeoutId = setTimeout(() => {
       this.clearTimer(key);
+      void this.handleMoveTimeout(defenseId);
     }, timeoutMs);
 
     this.timers.set(key, {
@@ -124,13 +136,8 @@ class TimerService {
       type: 'move',
       endTime,
       intervalId,
+      timeoutId,
     });
-  }
-
-  resetMoveTimer(defenseId: number) {
-    const config = defaultGameConfig;
-    const newDeadline = new Date(Date.now() + config.moveTime);
-    this.startMoveTimer(defenseId, newDeadline);
   }
 
   stopDefenseTimer(defenseId: number) {
@@ -150,7 +157,55 @@ class TimerService {
     const timer = this.timers.get(key);
     if (timer) {
       clearInterval(timer.intervalId);
+      clearTimeout(timer.timeoutId);
       this.timers.delete(key);
+    }
+  }
+
+  private async synchronizeTimers() {
+    try {
+      const activeDefenses = await prisma.defense.findMany({
+        where: { status: { in: [DefenseStatus.WAITING, DefenseStatus.IN_PROGRESS] } },
+        select: { id: true, status: true, expiresAt: true, moveDeadline: true },
+      });
+
+      const expectedKeys = new Set<string>();
+
+      for (const defense of activeDefenses) {
+        const type = defense.status === DefenseStatus.WAITING ? 'defense' : 'move';
+        const deadline = type === 'defense' ? defense.expiresAt : defense.moveDeadline;
+        const key = this.getTimerKey(defense.id, type);
+        expectedKeys.add(key);
+
+        if (!deadline || deadline.getTime() <= Date.now()) {
+          this.clearTimer(key);
+          if (type === 'defense') {
+            await this.handleDefenseExpire(defense.id);
+          } else {
+            await this.handleMoveTimeout(defense.id);
+          }
+          continue;
+        }
+
+        const existingTimer = this.timers.get(key);
+        if (existingTimer?.endTime === deadline.getTime()) {
+          continue;
+        }
+
+        if (type === 'defense') {
+          this.startDefenseTimer(defense.id, deadline);
+        } else {
+          this.startMoveTimer(defense.id, deadline);
+        }
+      }
+
+      for (const key of this.timers.keys()) {
+        if (!expectedKeys.has(key)) {
+          this.clearTimer(key);
+        }
+      }
+    } catch (error) {
+      console.error('Error synchronizing game timers:', error);
     }
   }
 
@@ -168,7 +223,10 @@ class TimerService {
 
       if (this.io) {
         this.io.emit('defenseUpdated', toDefensePublic(expiredDefense as any));
-        this.io.emit('defenseRemoved', defenseId);
+        const creator = await prisma.user.findUnique({ where: { id: expiredDefense.creatorId } });
+        if (creator) {
+          this.io.to(`user:${creator.id}`).emit('balanceUpdated', { balance: creator.balance });
+        }
       }
     } catch (error) {
       console.error(`Error expiring defense ${defenseId}:`, error);
@@ -177,56 +235,23 @@ class TimerService {
 
   private async handleMoveTimeout(defenseId: number) {
     try {
-      const defense = await prisma.defense.findUnique({
-        where: { id: defenseId },
-        include: { creator: true, attacker: true },
-      });
-
-      if (!defense || defense.status !== DefenseStatus.IN_PROGRESS) {
-        return;
-      }
-
-      // Timeout - defender wins
-      const totalPot = defense.bet * 2;
-
-      await prisma.$transaction(async (tx) => {
-        // Pay defender
-        const creator = await tx.user.update({
-          where: { id: defense.creatorId },
-          data: { balance: { increment: totalPot } },
-        });
-
-        // Update defense
-        await tx.defense.update({
-          where: { id: defenseId },
-          data: {
-            status: DefenseStatus.FINISHED,
-            result: GameResult.TIMEOUT,
-            winnerId: defense.creatorId,
-            finishedAt: new Date(),
-          },
-        });
-
-        // Create transaction
-        await tx.transaction.create({
-          data: {
-            userId: defense.creatorId,
-            defenseId,
-            type: 'WIN',
-            amount: totalPot,
-            balanceBefore: creator.balance - totalPot,
-            balanceAfter: creator.balance,
-            description: `Won defense #${defenseId} (timeout)`,
-          },
-        });
-      });
-
-      const finishedDefense = await getDefenseById(defenseId);
+      const finishedDefense = await finishTimedOutDefense(defenseId);
 
       if (this.io && finishedDefense) {
         const defensePublic = toDefensePublic(finishedDefense as any);
         this.io.to(`defense:${defenseId}`).emit('gameFinished', defensePublic);
         this.io.emit('defenseUpdated', defensePublic);
+
+        const creator = await prisma.user.findUnique({ where: { id: finishedDefense.creatorId } });
+        const attacker = finishedDefense.attackerId
+          ? await prisma.user.findUnique({ where: { id: finishedDefense.attackerId } })
+          : null;
+        if (creator) {
+          this.io.to(`user:${creator.id}`).emit('balanceUpdated', { balance: creator.balance });
+        }
+        if (attacker) {
+          this.io.to(`user:${attacker.id}`).emit('balanceUpdated', { balance: attacker.balance });
+        }
       }
     } catch (error) {
       console.error(`Error handling move timeout for defense ${defenseId}:`, error);
@@ -235,8 +260,13 @@ class TimerService {
 
   // Clean up all timers on shutdown
   cleanup() {
-    for (const [key, timer] of this.timers) {
+    if (this.maintenanceInterval) {
+      clearInterval(this.maintenanceInterval);
+      this.maintenanceInterval = null;
+    }
+    for (const [, timer] of this.timers) {
       clearInterval(timer.intervalId);
+      clearTimeout(timer.timeoutId);
     }
     this.timers.clear();
   }
