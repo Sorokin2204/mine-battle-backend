@@ -2,6 +2,7 @@ import { Server, Socket } from 'socket.io';
 import {
   createDefense,
   getAllDefenses,
+  getMyGamesPage,
   getDefenseById,
   startAttack,
   makeMove,
@@ -12,6 +13,7 @@ import { getUserById, toUserWithBalance } from '../../services/user.service';
 import { matchmakingService } from '../../services/matchmaking.service';
 import { timerService } from '../../services/timer.service';
 import { checkRateLimit } from '../../middleware/auth.middleware';
+import { getConfigByDifficulty } from '../../config/game.config';
 import {
   ClientToServerEvents,
   ServerToClientEvents,
@@ -25,6 +27,7 @@ import {
   DefensePublic,
   MoveResult,
   UserWithBalance,
+  ToolPreview,
 } from '../../types';
 
 type GameSocket = Socket<ClientToServerEvents, ServerToClientEvents, InterServerEvents, SocketData>;
@@ -56,6 +59,30 @@ export function registerDefenseHandlers(io: GameServer, socket: GameSocket) {
     }
   });
 
+  socket.on('getMyGames', async (data, callback) => {
+    try {
+      if (!checkRateLimit(userId, 'getMyGames', 60)) {
+        return callback({ success: false, error: 'Rate limit exceeded', code: 'RATE_LIMIT' });
+      }
+
+      const tab = data.tab === 'attacks' || data.tab === 'defenses' ? data.tab : 'all';
+      const offset = Math.max(0, Math.floor(data.offset || 0));
+      const limit = Math.min(20, Math.max(1, Math.floor(data.limit || 20)));
+      const page = await getMyGamesPage(userId, tab, offset, limit);
+
+      callback({
+        success: true,
+        data: {
+          ...page,
+          items: page.items.map((defense) => toDefensePublic(defense as any, defense.creatorId === userId)),
+        },
+      });
+    } catch (error) {
+      console.error('Error getting user games:', error);
+      callback({ success: false, error: 'Failed to get user games', code: 'SERVER_ERROR' });
+    }
+  });
+
   // Get single defense
   socket.on('getDefense', async (data, callback) => {
     try {
@@ -69,8 +96,7 @@ export function registerDefenseHandlers(io: GameServer, socket: GameSocket) {
         return callback({ success: false, error: 'Defense not found', code: 'NOT_FOUND' });
       }
 
-      const isParticipant = defense.creatorId === userId || defense.attackerId === userId;
-      callback({ success: true, data: toDefensePublic(defense as any, isParticipant) });
+      callback({ success: true, data: toDefensePublic(defense as any, defense.creatorId === userId) });
     } catch (error) {
       console.error('Error getting defense:', error);
       callback({ success: false, error: 'Failed to get defense', code: 'SERVER_ERROR' });
@@ -90,6 +116,7 @@ export function registerDefenseHandlers(io: GameServer, socket: GameSocket) {
       timerService.startDefenseTimer(defense.id, defense.expiresAt);
 
       const defensePublic = toDefensePublic(defense as any);
+      const creatorDefense = toDefensePublic(defense as any, true);
 
       // Check if there's a matching user in the matchmaking queue
       const matchedUser = matchmakingService.findMatch(defense);
@@ -113,7 +140,7 @@ export function registerDefenseHandlers(io: GameServer, socket: GameSocket) {
         socket.emit('balanceUpdated', { balance: user.balance });
       }
 
-      callback({ success: true, data: defensePublic });
+      callback({ success: true, data: creatorDefense });
     } catch (error: any) {
       console.error('Error creating defense:', error);
       callback({ success: false, error: error.message || 'Failed to create defense', code: 'CREATE_ERROR' });
@@ -135,8 +162,9 @@ export function registerDefenseHandlers(io: GameServer, socket: GameSocket) {
 
       const defensePublic = toDefensePublic(defense as any);
 
-      // Notify room about game start
-      io.to(`defense:${defense.id}`).emit('gameStarted', defensePublic);
+      // The board layout is private to its creator until the match ends.
+      io.to(`defense:${defense.id}`).except(`user:${defense.creatorId}`).emit('gameStarted', defensePublic);
+      io.to(`user:${defense.creatorId}`).emit('gameStarted', toDefensePublic(defense as any, true));
 
       // Notify all clients about defense update
       io.emit('defenseUpdated', defensePublic);
@@ -183,6 +211,10 @@ export function registerDefenseHandlers(io: GameServer, socket: GameSocket) {
       io.to(`defense:${data.defenseId}`).emit('moveMade', {
         defenseId: data.defenseId,
         move: result,
+      });
+      io.to(`defense:${data.defenseId}`).emit('toolPreviewUpdated', {
+        defenseId: data.defenseId,
+        preview: null,
       });
 
       // Publish every persisted move so badges receive the new moveDeadline.
@@ -257,6 +289,31 @@ export function registerDefenseHandlers(io: GameServer, socket: GameSocket) {
   // Leave defense room
   socket.on('leaveDefenseRoom', (data: { defenseId: number }) => {
     socket.leave(`defense:${data.defenseId}`);
+  });
+
+  // Broadcast the attacker's in-progress scanner/radar placement so the
+  // defender and spectators see the same board before the move is confirmed.
+  socket.on('updateToolPreview', async (data: { defenseId: number; preview: ToolPreview }) => {
+    try {
+      const defense = await getDefenseById(data.defenseId);
+      if (!defense || defense.status !== 'IN_PROGRESS' || defense.attackerId !== userId) return;
+
+      const config = getConfigByDifficulty(((defense as any).difficulty as any) || 'MEDIUM');
+      const preview = data.preview;
+      if (preview?.moveType === 'SCANNER') {
+        const positionsAreValid =
+          preview.positions.length === 4 &&
+          new Set(preview.positions).size === 4 &&
+          preview.positions.every((position) => Number.isInteger(position) && position >= 0 && position < config.fieldSize ** 2);
+        if (!positionsAreValid) return;
+      } else if (preview?.moveType === 'RADAR') {
+        if (!['row', 'column'].includes(preview.radarType) || !Number.isInteger(preview.index) || preview.index < 0 || preview.index >= config.fieldSize) return;
+      }
+
+      socket.to(`defense:${data.defenseId}`).emit('toolPreviewUpdated', data);
+    } catch (error) {
+      console.error('Error updating tool preview:', error);
+    }
   });
 
   // Get current user info

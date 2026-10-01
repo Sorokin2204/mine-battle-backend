@@ -71,6 +71,11 @@ export interface RadarResult {
   bombCount: number;
 }
 
+export type ToolPreview =
+  | { moveType: 'SCANNER'; positions: number[] }
+  | { moveType: 'RADAR'; radarType: 'row' | 'column'; index: number }
+  | null;
+
 export interface MoveResult {
   success: boolean;
   moveType: MoveType;
@@ -92,6 +97,21 @@ export interface GetDefensesData {
   includeExpired?: boolean;
 }
 
+export type MyGamesTab = 'all' | 'attacks' | 'defenses';
+
+export interface GetMyGamesData {
+  tab: MyGamesTab;
+  offset: number;
+  limit: number;
+}
+
+export interface MyGamesPage {
+  items: DefensePublic[];
+  total: number;
+  hasMore: boolean;
+  activeCounts: Record<MyGamesTab, number>;
+}
+
 // Socket Events - Client to Server
 export interface ClientToServerEvents {
   createDefense: (data: CreateDefenseData, callback: (response: SocketResponse<DefensePublic>) => void) => void;
@@ -99,9 +119,11 @@ export interface ClientToServerEvents {
   makeMove: (data: MakeMoveData, callback: (response: SocketResponse<MoveResult>) => void) => void;
   takeHalf: (data: TakeHalfData, callback: (response: SocketResponse<DefensePublic>) => void) => void;
   getDefenses: (dataOrCallback: GetDefensesData | ((response: SocketResponse<DefensePublic[]>) => void), callback?: (response: SocketResponse<DefensePublic[]>) => void) => void;
+  getMyGames: (data: GetMyGamesData, callback: (response: SocketResponse<MyGamesPage>) => void) => void;
   getDefense: (data: { defenseId: number }, callback: (response: SocketResponse<DefensePublic>) => void) => void;
   joinDefenseRoom: (data: { defenseId: number }) => void;
   leaveDefenseRoom: (data: { defenseId: number }) => void;
+  updateToolPreview: (data: { defenseId: number; preview: ToolPreview }) => void;
   getMe: (callback: (response: SocketResponse<UserWithBalance>) => void) => void;
   startMatchmaking: (data: StartMatchmakingData, callback: (response: SocketResponse<MatchmakingResponse>) => void) => void;
   stopMatchmaking: (callback: (response: SocketResponse<null>) => void) => void;
@@ -114,6 +136,7 @@ export interface ServerToClientEvents {
   defenseRemoved: (defenseId: number) => void;
   gameStarted: (defense: DefensePublic) => void;
   moveMade: (data: { defenseId: number; move: MoveResult }) => void;
+  toolPreviewUpdated: (data: { defenseId: number; preview: ToolPreview }) => void;
   gameFinished: (defense: DefensePublic) => void;
   timerUpdate: (data: { defenseId: number; timeLeft: number; type: 'move' | 'defense' }) => void;
   balanceUpdated: (data: { balance: number }) => void;

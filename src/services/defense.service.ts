@@ -1,6 +1,6 @@
-import { PrismaClient, Defense, DefenseStatus, GameResult, MoveType } from '@prisma/client';
+import { Prisma, PrismaClient, Defense, DefenseStatus, GameResult, MoveType } from '@prisma/client';
 import { getConfigByDifficulty, GameConfig, DifficultyLevel } from '../config/game.config';
-import { DefensePublic, MoveResult, ScannerResult, RadarResult } from '../types';
+import { DefensePublic, MoveResult, ScannerResult, RadarResult, MyGamesTab } from '../types';
 import { toUserPublic } from './user.service';
 
 const prisma = new PrismaClient();
@@ -132,6 +132,55 @@ export async function getAllDefenses(includeFinished: boolean = false, includeEx
       createdAt: 'desc',
     },
   });
+}
+
+export async function getMyGamesPage(userId: number, tab: MyGamesTab, offset: number, limit: number) {
+  const participantWhere: Prisma.DefenseWhereInput =
+    tab === 'attacks'
+      ? { attackerId: userId }
+      : tab === 'defenses'
+        ? { creatorId: userId }
+        : { OR: [{ creatorId: userId }, { attackerId: userId }] };
+
+  const now = new Date();
+  const activeWhere: Prisma.DefenseWhereInput = {
+    OR: [
+      { status: DefenseStatus.WAITING, expiresAt: { gt: now } },
+      {
+        status: DefenseStatus.IN_PROGRESS,
+        OR: [{ moveDeadline: null }, { moveDeadline: { gt: now } }],
+      },
+    ],
+  };
+
+  const allParticipantWhere: Prisma.DefenseWhereInput = {
+    OR: [{ creatorId: userId }, { attackerId: userId }],
+  };
+
+  const [items, total, activeAll, activeAttacks, activeDefenses] = await prisma.$transaction([
+    prisma.defense.findMany({
+      where: participantWhere,
+      include: { creator: true, attacker: true },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      skip: offset,
+      take: limit,
+    }),
+    prisma.defense.count({ where: participantWhere }),
+    prisma.defense.count({ where: { AND: [allParticipantWhere, activeWhere] } }),
+    prisma.defense.count({ where: { AND: [{ attackerId: userId }, activeWhere] } }),
+    prisma.defense.count({ where: { AND: [{ creatorId: userId }, activeWhere] } }),
+  ]);
+
+  return {
+    items,
+    total,
+    hasMore: offset + items.length < total,
+    activeCounts: {
+      all: activeAll,
+      attacks: activeAttacks,
+      defenses: activeDefenses,
+    },
+  };
 }
 
 export async function getDefenseById(defenseId: number): Promise<Defense | null> {
@@ -765,7 +814,7 @@ export async function expireDefense(defenseId: number): Promise<Defense> {
   });
 }
 
-export function toDefensePublic(defense: Defense & { creator: any; attacker: any | null }, isParticipant: boolean = false): DefensePublic {
+export function toDefensePublic(defense: Defense & { creator: any; attacker: any | null }, revealBombs: boolean = false): DefensePublic {
   // Calculate found bombs - positions that are in revealedCells AND in bombPositions
   const foundBombPositions = defense.revealedCells.filter(pos => defense.bombPositions.includes(pos));
 
@@ -791,7 +840,8 @@ export function toDefensePublic(defense: Defense & { creator: any; attacker: any
     winnerId: defense.winnerId,
     createdAt: defense.createdAt,
     finishedAt: defense.finishedAt,
-    // Only reveal all bomb positions if game is finished
-    bombPositions: defense.status === DefenseStatus.FINISHED ? defense.bombPositions : undefined,
+    // The creator may always inspect the defense they placed. Everyone else
+    // receives the full layout only after the game has ended.
+    bombPositions: revealBombs || defense.status === DefenseStatus.FINISHED ? defense.bombPositions : undefined,
   };
 }

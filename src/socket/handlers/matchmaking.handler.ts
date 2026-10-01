@@ -54,7 +54,7 @@ export function registerMatchmakingHandlers(io: GameServer, socket: GameSocket) 
 
       if (matchedDefense) {
         // Found a matching defense - notify immediately
-        const defensePublic = toDefensePublic(matchedDefense as any, true);
+        const defensePublic = toDefensePublic(matchedDefense as any);
         console.log(`Instant match found for user ${userId}! Defense: ${matchedDefense.id}`);
 
         // Send match found event
